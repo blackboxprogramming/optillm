@@ -105,3 +105,22 @@ To generate a coverage report:
 pytest tests/ --cov=optillm --cov-report=html
 open htmlcov/index.html
 ```
+
+## Batcher Lifecycle Regressions
+
+Run these focused tests from the repository root with only the Python standard
+library; no server, model downloads, or inference credentials are required:
+
+```bash
+python3 -B -m unittest discover -s tests -p test_batching_lifecycle.py -v
+```
+
+The tests import the batching module directly to avoid loading the server and
+optional inference dependencies. They cover concurrent queue creation, admission
+racing with shutdown, rejection after shutdown, queued-request failures, idle
+worker wakeups, and a processor requesting shutdown.
+
+Shutdown rejects new requests and fails requests still in queues with
+`BatchingError`. Requests already dequeued by a worker may finish. Joining each
+worker remains bounded to one second; shutdown does not interrupt a running
+processor or impose an inference timeout.

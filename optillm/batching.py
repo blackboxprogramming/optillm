@@ -74,6 +74,7 @@ class RequestBatcher:
         }
         
         self._shutdown = False
+        self._lifecycle_lock = threading.Lock()
         
         if self.enable_logging:
             logger.info(f"RequestBatcher initialized: max_batch_size={max_batch_size}, "
@@ -149,6 +150,8 @@ class RequestBatcher:
                         timeout = max(0.001, deadline - time.time())  # Minimum 1ms timeout
                         try:
                             request = queue_obj.get(timeout=timeout)
+                            if request is None:
+                                break
                             batch.append(request)
                             
                             if self.enable_logging and len(batch) == 1:
@@ -244,24 +247,27 @@ class RequestBatcher:
             # Generate key for request grouping
             queue_key = self._get_request_key(request_data)
             
-            # Create queue and processor if needed
-            if queue_key not in self.queues:
-                self.queues[queue_key] = queue.Queue()
-                self._create_batch_processor(queue_key)
-            
-            # Create batch request
-            future = Future()
-            batch_request = BatchRequest(
-                request_data=request_data,
-                future=future,
-                timestamp=time.time(),
-                model=request_data.get('model', 'default'),
-                approach=request_data.get('optillm_approach')
-            )
-            
-            # Add to appropriate queue
-            self.queues[queue_key].put(batch_request)
-            
+            with self._lifecycle_lock:
+                if self._shutdown:
+                    raise BatchingError("RequestBatcher is shut down")
+                # Create queue and processor if needed
+                if queue_key not in self.queues:
+                    self.queues[queue_key] = queue.Queue()
+                    self._create_batch_processor(queue_key)
+
+                # Create batch request
+                future = Future()
+                batch_request = BatchRequest(
+                    request_data=request_data,
+                    future=future,
+                    timestamp=time.time(),
+                    model=request_data.get('model', 'default'),
+                    approach=request_data.get('optillm_approach')
+                )
+
+                # Add to appropriate queue
+                self.queues[queue_key].put(batch_request)
+
             if self.enable_logging:
                 logger.debug(f"Added request to batch queue {queue_key}")
             
@@ -276,11 +282,30 @@ class RequestBatcher:
         return self.stats.copy()
     
     def shutdown(self):
-        """Shutdown the batcher and all background threads"""
-        self._shutdown = True
+        """Reject new work, fail queued requests, and let in-flight work finish."""
+        pending = []
+        with self._lifecycle_lock:
+            if not self._shutdown:
+                self._shutdown = True
+                for queue_obj in self.queues.values():
+                    while True:
+                        try:
+                            request = queue_obj.get_nowait()
+                        except queue.Empty:
+                            break
+                        if request is not None:
+                            pending.append(request)
+                    # Wake an idle worker without waiting for its batch deadline.
+                    queue_obj.put(None)
+            threads = list(self.batch_threads.values())
+
+        for request in pending:
+            if not request.future.done():
+                request.future.set_exception(BatchingError("RequestBatcher is shut down"))
+
         if self.enable_logging:
             logger.info("RequestBatcher shutting down...")
-        
-        # Wait for threads to finish
-        for thread in self.batch_threads.values():
-            thread.join(timeout=1.0)
+
+        for thread in threads:
+            if thread is not threading.current_thread():
+                thread.join(timeout=1.0)
